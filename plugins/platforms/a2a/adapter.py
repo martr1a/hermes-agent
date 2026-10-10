@@ -1,7 +1,9 @@
 """A2A inbound adapter: stdlib http.server (daemon thread) serving the Agent Card, /metrics and
 JSON-RPC (message/send, message/stream SSE, tasks/*, push-config CRUD). Inbound tasks are framed
 (security.wrap_inbound) and routed into the LIVE gateway session; ``send()`` fulfils the per-task
-Future the HTTP handler blocks on. No token configured => binds 127.0.0.1 only."""
+Future the HTTP handler blocks on. A message/send that outlives A2A_DETACH_AFTER answers ``working``
+with a liveness report and the caller follows the task through tasks/get. No token configured =>
+binds 127.0.0.1 only."""
 
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
+from hermes_constants import get_hermes_home
 
 from . import protocol, security
 
@@ -38,6 +41,8 @@ _DEFAULT_PORT = 9900
 _MIN_ORPHAN_TIMEOUT, _MAX_ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 86400, 60
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_TURN_END_GRACE = 180  # seconds a task may sit unanswered with no turn running before it counts as stalled
+_QUIET_AFTER = 120  # seconds of silence reported as "quiet" (two missed 60s session heartbeats)
 _DEFAULT_DESCRIPTION = "Hermes Agent — a general-purpose agent reachable over A2A."
 
 _ok = protocol.jsonrpc_result
@@ -74,6 +79,27 @@ def _reply_timeout() -> float:
 def _orphan_timeout() -> float:
     """Orphan grace must never expire before a configured reply window, but stays bounded."""
     return min(float(_MAX_ORPHAN_TIMEOUT), max(float(_MIN_ORPHAN_TIMEOUT), _reply_timeout()))
+
+
+def _env_seconds(name: str, default: float, floor: float) -> float:
+    try:
+        return max(floor, float(os.getenv(name, str(default))))
+    except (ValueError, TypeError):
+        return default
+
+
+def _detach_after() -> float:
+    """Seconds a blocking message/send holds the request open before it answers with a non-terminal
+    ``working`` Task that the caller follows through tasks/get. 0 disables detaching, and so does a
+    value at or beyond A2A_REPLY_TIMEOUT (the request then fails at the reply timeout as before)."""
+    return _env_seconds("A2A_DETACH_AFTER", 300.0, 0.0)
+
+
+def _stall_after() -> float:
+    """Seconds without session activity after which an unanswered task is declared stalled. A running
+    turn stamps its session at least once a minute, long tool calls included, so silence this long
+    means the turn is dead, not busy."""
+    return _env_seconds("A2A_STALL_AFTER", 900.0, 60.0)
 
 
 def _default_agent_name() -> str:
@@ -280,6 +306,9 @@ class A2AAdapter(BasePlatformAdapter):
         # do_GET/do_POST run on ThreadingHTTPServer's per-connection OS threads, which never inherit
         # the profile scope contextvar (same class as A2A_PORT above).
         self._public_url = _get_scoped_secret("A2A_PUBLIC_URL", "").strip()
+        # Same reason: the liveness report is read on HTTP and watchdog threads, from the state.db
+        # of the profile this adapter serves.
+        self._state_db_path = str(get_hermes_home() / "state.db")
         self._agents = self._load_served_agents(extra)
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._server_thread = self._watchdog_thread = None  # type: Optional[threading.Thread]
@@ -356,10 +385,11 @@ class A2AAdapter(BasePlatformAdapter):
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
-            try:
-                self._fail_orphans_once()
-            except Exception:
-                logger.debug("A2A: watchdog error", exc_info=True)
+            for sweep in (self._fail_orphans_once, self._fail_stalled_once):
+                try:
+                    sweep()
+                except Exception:
+                    logger.debug("A2A: watchdog error", exc_info=True)
 
     def _fail_orphans_once(self) -> list[str]:
         """Fail stale tasks that no request still owns."""
@@ -370,6 +400,25 @@ class A2AAdapter(BasePlatformAdapter):
         for tid in failed:
             logger.warning("A2A: orphaned task %s marked failed (timeout %gs)", tid, timeout)
             protocol.metrics.tasks_failed += 1
+        return failed
+
+    def _fail_stalled_once(self, min_age: float = _MIN_ORPHAN_TIMEOUT) -> list[str]:
+        """Fail tasks still awaiting a reply whose session stopped showing activity. The orphan sweep
+        never touches a task a request owns, and a detached task stays owned until its reply lands,
+        so without this a dead turn would leave its task ``working`` forever."""
+        with self._pending_lock:
+            waiting = [tid for tid, (_ctx, fut) in self._pending.items() if not fut.done()]
+        failed = []
+        for tid in waiting:
+            rec = self.tasks.get(tid)
+            if not rec or rec["state"] in protocol.TERMINAL_STATES or time.time() - rec["created_at"] < min_age:
+                continue
+            activity = self._task_activity(rec)
+            reason = activity.get("reason", "no activity")
+            # Resolving the future lets the waiting request (or the detached finalizer) record the failure.
+            if activity["health"] == "stalled" and self._resolve_task(tid, protocol.STATE_FAILED, f"[agent stalled — {reason}]"):
+                logger.warning("A2A: task %s stalled (%s) — failing it", tid, reason)
+                failed.append(tid)
         return failed
 
     def _load_served_agents(self, extra: dict) -> dict[str, dict]:
@@ -660,15 +709,101 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return on_timeout
 
-    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
+    def _await_reply(self, pending: dict, keepalive=None, detach_after: float = 0.0) -> tuple[str, str]:
+        """Wait for the task's reply until the reply timeout (-> failed). ``detach_after`` > 0 ends the
+        wait early with ``(STATE_WORKING, "")`` when that comes first: the task is not failed, the
+        caller detaches it."""
+        if 0 < detach_after < _reply_timeout():
+            return self._await_future(pending["future"], pending["started"] + detach_after, keepalive,
+                                      (protocol.STATE_WORKING, ""))
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
+
+    def _task_activity(self, rec: dict) -> dict:
+        """What the session serving this task is doing right now, from this profile's state.db (the
+        session's activity stamp and its turn lease). Sent to callers as Task ``metadata.hermes`` so a
+        waiting peer can tell *still working* from *stuck* instead of guessing from a timeout.
+        ``health``: starting / running / quiet / stalled / unknown."""
+        now = time.time()
+        created = float(rec.get("created_at") or now)
+        out: dict[str, Any] = {"elapsedSeconds": int(now - created), "health": "unknown"}
+        ctx = rec.get("context_id", "")
+        by_ctx = "source = 'a2a' AND chat_id = ?"
+        lease = note = None
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{self._state_db_path}?mode=ro", uri=True, timeout=2)) as con:
+                row = con.execute(
+                    "SELECT id, last_activity_at, last_activity_description, message_count, tool_call_count "
+                    f"FROM sessions WHERE {by_ctx} ORDER BY started_at DESC LIMIT 1", (ctx,)).fetchone()
+                if row:
+                    # The lease is keyed by the lineage root, which is not the newest row after a compression.
+                    lease = con.execute(
+                        "SELECT MAX(expires_at) FROM session_turn_leases WHERE conversation_id IN "
+                        f"(SELECT id FROM sessions WHERE {by_ctx})", (ctx,)).fetchone()
+                    note = con.execute(
+                        "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant' "
+                        "AND content IS NOT NULL AND content != '' ORDER BY id DESC LIMIT 1", (row[0],)).fetchone()
+        except Exception:
+            logger.debug("A2A: could not read task activity", exc_info=True)
+            return out
+        if not row:
+            # No session row yet: fine early on, a dispatch that never started a turn later.
+            if out["elapsedSeconds"] > _TURN_END_GRACE:
+                out.update(health="stalled", reason="no session was ever started for this task")
+            else:
+                out["health"] = "starting"
+            return out
+        idle = max(0, int(now - float(row[1] or created)))
+        turn_active = bool(lease and lease[0] and float(lease[0]) > now)
+        out.update(idleSeconds=idle, turnActive=turn_active, lastActivity=str(row[2] or ""),
+                   messages=int(row[3] or 0), toolCalls=int(row[4] or 0))
+        if note and isinstance(note[0], str):
+            out["lastNote"] = security.redact_outbound(" ".join(note[0].split())[:240])
+        if idle > _stall_after():
+            out.update(health="stalled", reason=f"no activity for {idle}s")
+        elif not turn_active and idle > _TURN_END_GRACE:
+            out.update(health="stalled", reason=f"its turn ended {idle}s ago without producing a reply")
+        else:
+            out["health"] = "quiet" if idle > _QUIET_AFTER else "running"  # quiet: typically one long tool call
+        return out
+
+    def _task_view(self, rec: dict) -> dict:
+        """Stored record as a Task; one still awaiting its reply also carries the liveness report."""
+        task = protocol.TaskStore.to_task(rec)
+        with self._pending_lock:
+            awaited = rec["task_id"] in self._pending
+        if awaited and rec["state"] not in protocol.TERMINAL_STATES:
+            task["metadata"] = {"hermes": self._task_activity(rec)}
+        return task
+
+    def _detach(self, pending: dict) -> dict:
+        """Stop holding the HTTP request open for this task, but still record its outcome when the
+        agent eventually answers. Returns the Task to answer with (non-terminal unless the reply
+        landed meanwhile)."""
+        def finalize(fut: Future) -> None:
+            try:
+                state, reply = fut.result()
+            except Exception:
+                state, reply = protocol.STATE_FAILED, "[agent processing failed]"
+            self._finalize_task(pending, state, reply)
+
+        # The future is resolved under _pending_lock, which _finalize_task takes again: hand off to
+        # a thread instead of finalizing inside the callback.
+        pending["future"].add_done_callback(lambda fut: _daemon_thread(lambda: finalize(fut), "a2a-finalize"))
+        rec = self.tasks.get(pending["task_id"])
+        return self._task_view(rec) if rec else protocol.build_task(
+            pending["task_id"], pending["context_id"], protocol.STATE_WORKING, created_at=pending["created_iso"])
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            state, reply = self._await_reply(pending, detach_after=_detach_after())
+            if state == protocol.STATE_WORKING:
+                # Still working: answer now with a live status instead of failing the caller on a timeout.
+                task = self._detach(pending)
+            else:
+                state, reply = self._finalize_task(pending, state, reply)
+                task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -743,7 +878,7 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
         _task_id, rec, error = self._find_task(req_id, params, agent)
-        return error or _ok(req_id, protocol.TaskStore.to_task(rec))
+        return error or _ok(req_id, self._task_view(rec))
 
     def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
         offset = _to_int(params.get("pageToken") or 0, 0)

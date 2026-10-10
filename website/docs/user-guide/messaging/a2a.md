@@ -47,6 +47,7 @@ With the `a2a` toolset enabled, the agent gets:
 |---|---|
 | `a2a_discover(url)` | Fetch and summarize a peer's Agent Card |
 | `a2a_call(agent, message, context_id?)` | Send a task, get the reply; multi-turn via `context_id` |
+| `a2a_status(agent, task_id, wait_s?)` | Keep waiting on a task `a2a_call` reported as still running; tells whether the peer is working or stuck |
 | `a2a_list()` | Configured peers, saved conversations, metrics |
 | `a2a_history(context_id)` | Recall a persisted A2A conversation |
 | `a2a_orchestrate(capability, message, mode?)` | Fan a task out to every peer advertising a capability (`all` / `first` / `best`) |
@@ -103,6 +104,8 @@ Secure by default; every widening step is explicit:
 | `A2A_RATE_LIMIT` | `60` | Requests/minute per identity |
 | `A2A_MAX_PINGPONG_TURNS` | `5` | Anti-loop turn cap per context (max 20) |
 | `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply. The orphan-task sweep never fails a task before this window elapses (floor 300s), and never while a request is still waiting on it |
+| `A2A_DETACH_AFTER` | `300` | Seconds a blocking `message/send` waits before answering `working` with a liveness report (`metadata.hermes`); the caller follows the task via `GetTask`. Takes effect only below `A2A_REPLY_TIMEOUT`; `0` disables |
+| `A2A_STALL_AFTER` | `900` | Seconds without session activity after which a task still awaiting its reply is failed as stalled (floor 60s) |
 | `A2A_PUSH_SECRET` | bearer token | HMAC secret for push-notification signing |
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict which skills appear on the Agent Card |
 

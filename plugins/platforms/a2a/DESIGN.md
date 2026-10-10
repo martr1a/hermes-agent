@@ -23,6 +23,9 @@ must not touch core files.** A2A now lives entirely under
   task to a peer, return the reply. Multi-turn via `context_id` (carried
   inside the Message per v1.0). Surfaces `TASK_STATE_INPUT_REQUIRED` so the
   model knows to answer and continue the context.
+- `a2a_status(agent, task_id, wait_s?)` — follow a task the peer reported as
+  still `working` (a `message/send` that outlived the peer's detach window);
+  `a2a_call` does the same polling itself for the rest of the peer `timeout`.
 - `a2a_list()` — configured peers + persisted conversations + metrics.
 - `a2a_history(context_id, limit?)` — recall a persisted conversation
   (this is the production consumer of the persistence layer).

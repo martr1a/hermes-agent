@@ -1,12 +1,14 @@
-"""A2A client tools (``a2a`` toolset): a2a_discover/call/list/history/orchestrate talk to *other*
+"""A2A client tools (``a2a`` toolset): a2a_discover/call/status/list/history/orchestrate talk to *other*
 agents. Peers come from config.yaml ``a2a_agents: {name: {url, auth: {type: bearer, token}, timeout,
-capabilities}}``. Stdlib urllib; wire format is A2A v1.0 ``SendMessage`` (v0.3 replies still parse)."""
+capabilities}}``. Stdlib urllib; wire format is A2A v1.0 ``SendMessage`` (v0.3 replies still parse).
+A peer that answers ``working`` is followed through ``GetTask`` for the rest of its ``timeout``."""
 
 from __future__ import annotations
 
 import contextlib
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
+_POLL_INTERVAL = 10  # seconds between GetTask polls while a peer is still working
+_POLL_MAX_ERRORS = 5  # consecutive failed polls before giving up on a task
+_STATUS_DEFAULT_WAIT = 600  # a2a_status wait_s default, seconds
+_RUNNING_STATES = frozenset({protocol.STATE_SUBMITTED, protocol.STATE_WORKING})
 
 
 def _load_config() -> dict:
@@ -92,40 +98,124 @@ def _rpc_url(base_url: str, card: Optional[dict]) -> str:
     return base_url.rstrip("/")
 
 
-def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> tuple[str, str, str]:
-    """One SendMessage to a peer -> (reply_text, context_id, state). Raises urllib errors /
-    ValueError for the caller to format; handles redaction, audit, persistence, metrics."""
+def _peer_endpoint(peer: dict, timeout: int) -> tuple[str, dict, str]:
+    """(rpc_url, auth headers, tenant) for a peer; the card fetch is best-effort, to learn the rpc URL."""
     base_url = peer.get("url", "")
     headers = _auth_header(peer.get("auth", {}) or {})
-    timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
     try:
-        card = _fetch_card(base_url, headers, min(timeout, 30))  # best-effort, to learn the rpc URL
+        card = _fetch_card(base_url, headers, min(timeout, 30))
     except Exception:
         card = None
+    iface = _select_jsonrpc_interface(card)
+    tenant = str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
+    return _rpc_url(base_url, card), headers, tenant
+
+
+def _task_state(task: Any) -> str:
+    return (task.get("status") or {}).get("state", "") if isinstance(task, dict) else ""
+
+
+def _short_state(state: str) -> str:
+    return state.replace("TASK_STATE_", "").replace("_", "-").lower()  # v0.3 states pass through
+
+
+def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> tuple[str, str, str]:
+    """One SendMessage to a peer -> (reply_text, context_id, state). Raises urllib errors /
+    ValueError for the caller to format; handles redaction, audit, persistence, metrics. A peer
+    that answers with a still-running Task is followed until ``timeout`` from the start of the call;
+    if it is still running then, the reply text is a status report and ``state`` stays non-terminal."""
+    timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
+    started = time.time()
+    rpc_url, headers, tenant = _peer_endpoint(peer, timeout)
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
     rpc_body = {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": "SendMessage",
                 "params": {"message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx)}}
-    iface = _select_jsonrpc_interface(card)
-    tenant = str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
     if tenant:
         rpc_body["params"]["tenant"] = tenant
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout)
     if "error" in resp:
         raise ValueError(f"Peer '{agent_label}' returned an error: {resp['error'].get('message', resp['error'])}")
     payload = protocol.unwrap_send_message_response(resp.get("result", {}))
-    reply = _reply_text_from_result(payload)
-    reply_ctx, state = ctx, ""
+    reply_ctx, state = ctx, _task_state(payload)
     if isinstance(payload, dict):
         reply_ctx = payload.get("contextId", ctx)
-        state = (payload.get("status") or {}).get("state", "")
+        task_id = str(payload.get("id") or "")
+        if task_id and state in _RUNNING_STATES:
+            payload = _follow_task(agent_label, rpc_url, headers, tenant, task_id, payload, deadline=started + timeout)
+            if (state := _task_state(payload)) in _RUNNING_STATES:
+                return _progress_text(agent_label, task_id, payload, waited=time.time() - started), reply_ctx, state
+    reply = _reply_text_from_result(payload)
     protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])
     protocol.metrics.inbound_total += 1
     return reply, reply_ctx, state
+
+
+class _PeerTaskError(ValueError):
+    """The peer answered a GetTask with a JSON-RPC error (unknown task, wrong scope)."""
+
+
+def _get_task(rpc_url: str, headers: dict, tenant: str, task_id: str) -> dict:
+    """One GetTask round-trip -> the Task object."""
+    body = {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": "GetTask", "params": {"id": task_id}}
+    if tenant:
+        body["params"]["tenant"] = tenant
+    resp = _http_post_json(rpc_url, body, headers, 30)
+    if "error" in resp:
+        err = resp["error"]
+        raise _PeerTaskError(f"Peer returned an error for task {task_id}: {err.get('message', err) if isinstance(err, dict) else err}")
+    task = protocol.unwrap_send_message_response(resp.get("result", {}))
+    return task if isinstance(task, dict) else {}
+
+
+def _follow_task(agent_label: str, rpc_url: str, headers: dict, tenant: str, task_id: str, task: dict, deadline: float) -> dict:
+    """Poll a running task until it finishes or ``deadline`` passes -> the latest Task. The peer
+    fails a task itself once its session stops showing activity, so a stuck peer ends this loop with
+    a terminal ``failed`` Task rather than a silent wait to the deadline."""
+    errors = 0
+    while time.time() < deadline:
+        time.sleep(max(0.0, min(_POLL_INTERVAL, deadline - time.time())))
+        try:
+            task = _get_task(rpc_url, headers, tenant, task_id)
+        except _PeerTaskError:
+            raise
+        except Exception as e:
+            errors += 1
+            if errors >= _POLL_MAX_ERRORS:
+                raise RuntimeError(f"lost contact with peer '{agent_label}' while task {task_id} was running ({e}); "
+                                   f"check it with a2a_status(agent='{agent_label}', task_id='{task_id}') instead of resending")
+            continue
+        errors = 0
+        if _task_state(task) not in _RUNNING_STATES:
+            break
+    return task
+
+
+def _progress_text(agent_label: str, task_id: str, task: dict, waited: float) -> str:
+    """Model-readable status of a task that has not finished yet, from the peer's liveness report."""
+    act = (task.get("metadata") or {}).get("hermes") or {}
+    health = act.get("health", "unknown")
+    lines = [f"Peer '{agent_label}' has NOT finished yet (waited {int(waited)}s) — task {task_id}."]
+    if health in ("running", "quiet", "starting"):
+        bits = ([f"last activity {act['idleSeconds']}s ago"] if "idleSeconds" in act else []) \
+            + ([act["lastActivity"]] if act.get("lastActivity") else []) \
+            + ([f"{act['toolCalls']} tool calls so far"] if "toolCalls" in act else [])
+        lines.append("Status: STILL RUNNING" + (f" ({'; '.join(bits)})" if bits else "") + ".")
+        if health == "quiet":
+            lines.append("It has been silent for a while — usually one long tool call, not a hang.")
+    elif health == "stalled":
+        lines.append(f"Status: STUCK — {act.get('reason', 'no activity')}.")
+    else:
+        lines.append("Status: unknown — the peer reports the task open but gave no activity details.")
+    if act.get("lastNote"):
+        lines.append(f"Its latest note: {act['lastNote']}")
+    lines.append(f"Do NOT resend the task. Call a2a_status(agent='{agent_label}', task_id='{task_id}') "
+                 "to keep waiting for the result; meanwhile you may do other work.")
+    return "\n".join(lines)
 
 
 def _reply_text_from_result(result: Any) -> str:
@@ -188,11 +278,55 @@ def a2a_call(args: dict, **_: Any) -> str:
         return str(e)
     except Exception as e:
         return f"Error: call to '{agent}' failed — {e}."
-    short_state = state.replace("TASK_STATE_", "").replace("_", "-").lower()  # v0.3 states pass through
-    header = f"[{agent} · context {reply_ctx}" + (f" · {short_state}" if state else "") + "]"
+    header = f"[{agent} · context {reply_ctx}" + (f" · {_short_state(state)}" if state else "") + "]"
     body = reply or "(no text reply)"
+    if state == protocol.STATE_FAILED:
+        body = f"The peer's task FAILED: {body}"
     if state == protocol.STATE_INPUT_REQUIRED:
         body += f"\n\n(The peer needs more input — answer by calling a2a_call again with context_id '{reply_ctx}'.)"
+    return f"{header}\n{body}"
+
+
+def a2a_status(args: dict, **_: Any) -> str:
+    """Check a task a peer is still working on, waiting up to ``wait_s`` for it: the peer's reply
+    once it has finished, else whether the peer is still running or stuck."""
+    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+    task_id = str(args.get("task_id") or args.get("taskId") or args.get("id") or "").strip()
+    if not agent or not task_id:
+        return "Error: both 'agent' and 'task_id' are required."
+    peer = _resolve_peer(agent)
+    if not peer or not peer.get("url"):
+        return f"Error: unknown agent '{agent}'. Use the same agent name or URL as in the a2a_call that returned the task id."
+    timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
+    try:
+        wait_s = float(args.get("wait_s", _STATUS_DEFAULT_WAIT))
+    except (TypeError, ValueError):
+        wait_s = float(_STATUS_DEFAULT_WAIT)
+    wait_s = max(0.0, min(wait_s, float(timeout)))
+    started = time.time()
+    try:
+        rpc_url, headers, tenant = _peer_endpoint(peer, timeout)
+        task = _get_task(rpc_url, headers, tenant, task_id)
+        if _task_state(task) in _RUNNING_STATES and wait_s > 0:
+            task = _follow_task(agent, rpc_url, headers, tenant, task_id, task, deadline=started + wait_s)
+    except urllib.error.HTTPError as e:
+        return _HTTP_CALL_ERRORS.get(e.code, "Error: status check on '{agent}' failed — HTTP {code}.").format(agent=agent, code=e.code)
+    except _PeerTaskError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: status check on '{agent}' failed — {e}."
+    state, ctx = _task_state(task), str(task.get("contextId") or "")
+    header = f"[{agent} · context {ctx} · task {task_id}" + (f" · {_short_state(state)}" if state else "") + "]"
+    if state in _RUNNING_STATES:
+        return f"{header}\n{_progress_text(agent, task_id, task, waited=time.time() - started)}"
+    reply = _reply_text_from_result(task)
+    if ctx:
+        protocol.persist_message(ctx, "agent", reply, task_id)
+    body = reply or "(no text reply)"
+    if state == protocol.STATE_FAILED:
+        body = f"The peer's task FAILED: {body}"
+    if state == protocol.STATE_INPUT_REQUIRED:
+        body += f"\n\n(The peer needs more input — answer by calling a2a_call with context_id '{ctx}'.)"
     return f"{header}\n{body}"
 
 
@@ -302,11 +436,22 @@ _TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
     "a2a_call": (a2a_call,
                  "Send a natural-language task to a remote A2A agent and return its reply. The agent is a peer "
                  "(any A2A-compliant framework), not a sub-agent you control. Pass 'context_id' from a previous "
-                 "reply to continue a multi-turn exchange.",
+                 "reply to continue a multi-turn exchange. A long task is waited on while the peer shows activity; "
+                 "if it is still running when the wait budget ends you get a status with a task id — follow it "
+                 "with a2a_status, do not resend the task.",
                  {"agent": _str("Configured peer name (from a2a_agents) or a full http(s):// URL."),
                   "message": _str("The task / message to send the peer, in natural language."),
                   "context_id": _str("Optional: context id from a prior reply, to continue the conversation.")},
                  ["agent", "message"]),
+    "a2a_status": (a2a_status,
+                   "Check on a task a peer agent is still working on (the task id comes from an a2a_call that "
+                   "reported 'has NOT finished yet'). Waits up to 'wait_s' for it to finish and returns the reply, "
+                   "or reports whether the peer is still running or stuck.",
+                   {"agent": _str("The same peer name / URL used in a2a_call."),
+                    "task_id": _str("Task id reported by a2a_call."),
+                    "wait_s": {"type": "number", "description": "Seconds to keep waiting for completion (default 600, "
+                                                                "capped at the peer's timeout; 0 = just check)."}},
+                   ["agent", "task_id"]),
     "a2a_list": (a2a_list, "List configured A2A peer agents, persisted A2A conversations, and metrics.", {}, []),
     "a2a_history": (a2a_history,
                     "Recall a persisted A2A conversation transcript by context_id (survives restarts and "
